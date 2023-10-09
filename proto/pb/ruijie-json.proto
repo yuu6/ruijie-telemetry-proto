@@ -1,0 +1,23 @@
+syntax = "proto3";
+package ruijie_json;
+option go_package = "proto/pb;pb";
+
+service Json {
+  rpc JsonSend (JsonRequest) returns (JsonReply) {}
+}
+message JsonDeviceMsg {
+  string producer_name = 1;
+  string device_name = 2;
+  string device_model = 3;
+}
+// 厂商名称 // 设备名称 // 设备型号
+message JsonRequest {
+  JsonDeviceMsg device_info = 1;
+  uint32 json_event = 2;
+  string json_string = 3;
+  int64 timestamp = 4 [deprecated=true];
+  string sensor_path = 5 [deprecated=true];
+}
+message JsonReply {
+sint32 ret = 1; // 处理是否成功，成功为 1，失败为 0
+}
