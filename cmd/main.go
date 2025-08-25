@@ -5,18 +5,21 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	jsonparser "github.com/influxdata/telegraf/plugins/parsers/json"
+	client "github.com/influxdata/influxdb1-client"
+	"github.com/luscis/ruijie-telemetry-proto/model"
 	pb "github.com/luscis/ruijie-telemetry-proto/proto/pb"
 	gnmiLib "github.com/openconfig/gnmi/proto/gnmi"
-	"github.com/openconfig/ygot/ygot"
 	"google.golang.org/grpc"
 	"log"
 	"net"
+	"net/url"
+	"os"
 	"strings"
+	"time"
 )
 
-const RuijieGrpcServerPort = "172.30.17.163:57000"
-const RuijieSwitch = "172.30.19.12"
+const RuijieGrpcServerPort = ":12345"
+const TelegrafURL = "http://10.56.113.92:8881"
 
 // Parse path to path-buffer and tag-field
 //
@@ -28,6 +31,7 @@ func handlePath(gnmiPath *gnmiLib.Path, tags map[string]string, prefix string) (
 	for _, elem := range gnmiPath.Elem {
 		if len(elem.Name) > 0 {
 			if _, err := builder.WriteString(strings.ToUpper(elem.Name)); err != nil {
+				fmt.Fprintln(os.Stderr, err)
 				return "", err
 			}
 		}
@@ -50,43 +54,59 @@ func handlePath(gnmiPath *gnmiLib.Path, tags map[string]string, prefix string) (
 
 type server struct {
 	pb.UnimplementedJsonServer
+	client *client.Client
 }
 
 func (s *server) JsonSend(ctx context.Context, in *pb.JsonRequest) (*pb.JsonReply, error) {
-	//fmt.Printf("\n\nReceived: %v %s\n", in.DeviceInfo, in.SensorPath)
+	//fmt.Printf("\n\nReceived Data : %v \n", in)
 
-	spath, err := ygot.StringToStructuredPath(in.SensorPath)
+	//// 创建写入的批次（BatchPoints）
+	//bp, err := client.NewBatchPoints(client.BatchPointsConfig{
+	//	Database:        "switch-telemetry", // 指定数据库（db）
+	//	RetentionPolicy: "autogen",          // 可选：保留策略，通常为 autogen
+	//	Precision:       "ms",               // 时间精度：ns（纳秒）、us、ms、s
+	//})
+	//if err != nil {
+	//	log.Fatal("Error creating batch points:", err)
+	//}
+	batchPoints := client.BatchPoints{
+		Database: "switch-telemetry",
+	}
+	now := time.Now().Add(-1 * time.Minute)
+
+	if in.JsonEvent == model.IFMDataKey {
+		var value model.Response[model.IFMData]
+
+		if err := json.Unmarshal([]byte(in.JsonString), &value); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return nil, fmt.Errorf("failed to parse JSON value: %w", err)
+		}
+		// 遍历数据并创建数据点
+		for _, datum := range value.Data {
+			// 创建数据点
+			pt := client.Point{
+				Measurement: "ifm_interface", // measurement
+				Tags: map[string]string{ // tags
+					"ifx":       datum.PortName,
+					"port_name": datum.PortName,
+				},
+				Time: now,
+				Fields: map[string]interface{}{ // fields
+					"outp_drop_pkts": datum.OutpDropPkts,
+				},
+			}
+			batchPoints.Points = append(batchPoints.Points, pt)
+		}
+	}
+
+	fmt.Printf("Batch points: %v\n", batchPoints)
+
+	write, err := s.client.Write(batchPoints)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse Path value: %w", err)
+		fmt.Fprintln(os.Stderr, err)
+		return nil, err
 	}
-
-	tags := make(map[string]string, 2)
-	gpath, err := handlePath(spath, tags, "")
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse Path value: %w", err)
-	}
-
-	fmt.Printf("\n\nReceived: %v %v\n", in.DeviceInfo, in.SensorPath)
-
-	var value interface{}
-	if err := json.Unmarshal([]byte(in.JsonString), &value); err != nil {
-		return nil, fmt.Errorf("failed to parse JSON value: %w", err)
-	}
-	// fmt.Printf("%v\n", value)
-	fields := make(map[string]interface{})
-	flattener := jsonparser.JSONFlattener{Fields: fields}
-	if err := flattener.FullFlattenJSON(strings.Replace(gpath, "-", "_", -1), value, true, true); err != nil {
-		return nil, fmt.Errorf("failed to flatten JSON: %w", err)
-	}
-
-	label := "{"
-	for k, v := range tags {
-		label += fmt.Sprintf("%s=%s", k, v)
-	}
-	label += "}"
-	for k, v := range fields {
-		fmt.Printf("%s %s %v\n", k, label, v)
-	}
+	log.Printf("wrote %d", write)
 
 	return &pb.JsonReply{Ret: 1}, nil
 }
@@ -96,8 +116,26 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to listen: %v", err)
 	}
+
+	parse, err := url.Parse(TelegrafURL)
+	if err != nil {
+		return
+	}
+
+	c, err := client.NewClient(client.Config{
+		URL: *parse, // InfluxDB v1 地址
+		// Username: "your-username",   // 如果启用了认证
+		// Password: "your-password",
+	})
+	if err != nil {
+		log.Fatal("Error creating InfluxDB client:", err)
+	}
 	s := grpc.NewServer()
-	pb.RegisterJsonServer(s, &server{})
+
+	pb.RegisterJsonServer(s, &server{
+		client: c,
+	})
+
 	if err := s.Serve(lis); err != nil {
 		log.Fatalf("failed to serve: %v", err)
 	}
