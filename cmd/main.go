@@ -5,21 +5,22 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	client "github.com/influxdata/influxdb1-client"
 	"github.com/luscis/ruijie-telemetry-proto/model"
 	pb "github.com/luscis/ruijie-telemetry-proto/proto/pb"
 	gnmiLib "github.com/openconfig/gnmi/proto/gnmi"
 	"google.golang.org/grpc"
+	"io"
 	"log"
 	"net"
-	"net/url"
+	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
 
 const RuijieGrpcServerPort = ":12345"
-const TelegrafURL = "http://10.56.113.92:8881"
+const TelegrafURL = "http://xxxx:8881"
 
 // Parse path to path-buffer and tag-field
 //
@@ -54,26 +55,12 @@ func handlePath(gnmiPath *gnmiLib.Path, tags map[string]string, prefix string) (
 
 type server struct {
 	pb.UnimplementedJsonServer
-	client *client.Client
 }
 
 func (s *server) JsonSend(ctx context.Context, in *pb.JsonRequest) (*pb.JsonReply, error) {
-	//fmt.Printf("\n\nReceived Data : %v \n", in)
-
-	//// 创建写入的批次（BatchPoints）
-	//bp, err := client.NewBatchPoints(client.BatchPointsConfig{
-	//	Database:        "switch-telemetry", // 指定数据库（db）
-	//	RetentionPolicy: "autogen",          // 可选：保留策略，通常为 autogen
-	//	Precision:       "ms",               // 时间精度：ns（纳秒）、us、ms、s
-	//})
-	//if err != nil {
-	//	log.Fatal("Error creating batch points:", err)
-	//}
-	batchPoints := client.BatchPoints{
-		Database: "switch-telemetry",
-	}
-	now := time.Now().Add(-1 * time.Minute)
-
+	var lines []string
+	aTime := time.Now()
+	// 可以自行丰富
 	if in.JsonEvent == model.IFMDataKey {
 		var value model.Response[model.IFMData]
 
@@ -84,31 +71,107 @@ func (s *server) JsonSend(ctx context.Context, in *pb.JsonRequest) (*pb.JsonRepl
 		// 遍历数据并创建数据点
 		for _, datum := range value.Data {
 			// 创建数据点
-			pt := client.Point{
-				Measurement: "ifm_interface", // measurement
-				Tags: map[string]string{ // tags
-					"ifx":       datum.PortName,
-					"port_name": datum.PortName,
-				},
-				Time: now,
-				Fields: map[string]interface{}{ // fields
-					"outp_drop_pkts": datum.OutpDropPkts,
-				},
+			tags := map[string]string{
+				"ifx":       strconv.Itoa(datum.Ifx),
+				"port_name": datum.PortName,
 			}
-			batchPoints.Points = append(batchPoints.Points, pt)
+			fields := map[string]interface{}{
+				"outp_drop_pkts": datum.OutpDropPkts,
+			}
+
+			line := pointToLineProtocol("ifm_interface", tags, fields, aTime)
+			lines = append(lines, line)
 		}
 	}
 
-	fmt.Printf("Batch points: %v\n", batchPoints)
+	// 拼接所有行
+	body := strings.Join(lines, "\n")
 
-	write, err := s.client.Write(batchPoints)
+	resp, err := http.Post(TelegrafURL+"/write", "text/plain", strings.NewReader(body))
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		fmt.Fprintln(os.Stderr, "HTTP Post error:", err)
 		return nil, err
 	}
-	log.Printf("wrote %d", write)
+	defer resp.Body.Close()
 
+	// 检查响应
+	if resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusOK {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		errMsg := fmt.Sprintf("Telegraf returned %d: %s", resp.StatusCode, string(bodyBytes))
+		fmt.Fprintln(os.Stderr, errMsg)
+		return nil, fmt.Errorf(errMsg)
+	}
+
+	fmt.Printf("Sent %d points to Telegraf\n", len(lines))
 	return &pb.JsonReply{Ret: 1}, nil
+}
+
+// escape 用于转义 Line Protocol 中的特殊字符
+func escape(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `,`, `\,`)
+	s = strings.ReplaceAll(s, ` `, `\ `)
+	s = strings.ReplaceAll(s, `=`, `\=`)
+	return s
+}
+
+// pointToLineProtocol 将数据点转换为 InfluxDB Line Protocol 字符串
+func pointToLineProtocol(measurement string, tags map[string]string, fields map[string]interface{}, t time.Time) string {
+	var line strings.Builder
+
+	// 1. measurement
+	line.WriteString(escape(measurement))
+
+	// 2. tags
+	tagKeys := make([]string, 0, len(tags))
+	for k := range tags {
+		tagKeys = append(tagKeys, k)
+	}
+	// 推荐排序以保证一致性
+	for _, k := range tagKeys {
+		line.WriteString(",")
+		line.WriteString(escape(k))
+		line.WriteString("=")
+		line.WriteString(escape(tags[k]))
+	}
+
+	line.WriteString(" ")
+
+	// 3. fields
+	fieldKeys := make([]string, 0, len(fields))
+	for k := range fields {
+		fieldKeys = append(fieldKeys, k)
+	}
+	for i, k := range fieldKeys {
+		if i > 0 {
+			line.WriteString(",")
+		}
+		line.WriteString(escape(k))
+		line.WriteString("=")
+
+		v := fields[k]
+		switch val := v.(type) {
+		case int, int8, int16, int32, int64:
+			line.WriteString(fmt.Sprintf("%di", val))
+		case uint, uint8, uint16, uint32, uint64:
+			line.WriteString(fmt.Sprintf("%du", val))
+		case float32, float64:
+			line.WriteString(fmt.Sprintf("%g", val))
+		case string:
+			escaped := strings.ReplaceAll(val, `"`, `\"`)
+			line.WriteString(`"` + escaped + `"`)
+		case bool:
+			line.WriteString(fmt.Sprintf("%v", val))
+		default:
+			line.WriteString(`"unknown"`)
+		}
+	}
+
+	// 4. timestamp (nanoseconds)
+	line.WriteString(" ")
+	line.WriteString(fmt.Sprintf("%d", t.UnixNano()))
+
+	return line.String()
 }
 
 func main() {
@@ -117,24 +180,12 @@ func main() {
 		log.Fatalf("failed to listen: %v", err)
 	}
 
-	parse, err := url.Parse(TelegrafURL)
-	if err != nil {
-		return
-	}
-
-	c, err := client.NewClient(client.Config{
-		URL: *parse, // InfluxDB v1 地址
-		// Username: "your-username",   // 如果启用了认证
-		// Password: "your-password",
-	})
 	if err != nil {
 		log.Fatal("Error creating InfluxDB client:", err)
 	}
 	s := grpc.NewServer()
 
-	pb.RegisterJsonServer(s, &server{
-		client: c,
-	})
+	pb.RegisterJsonServer(s, &server{})
 
 	if err := s.Serve(lis); err != nil {
 		log.Fatalf("failed to serve: %v", err)
